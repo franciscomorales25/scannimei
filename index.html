@@ -106,7 +106,8 @@ ol.log li.fresh{background:var(--ok-bg)}
 .cam .camtop{position:absolute;left:0;right:0;top:0;padding:calc(14px + env(safe-area-inset-top,0px)) 16px 14px;color:#fff;background:linear-gradient(rgba(0,0,0,.7),transparent);font-weight:600;font-size:1.05rem;text-align:center;word-break:break-all}
 .cam .cambar{position:absolute;left:0;right:0;bottom:0;padding:16px 16px calc(16px + env(safe-area-inset-bottom,0px));display:flex;gap:10px;justify-content:center;background:linear-gradient(transparent,rgba(0,0,0,.7))}
 .cam .cambar button{min-width:120px;padding:14px 18px}
-.cam #torchBtn{background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.4)}
+.cam .cambar #zoomBtn{min-width:96px}
+.cam #torchBtn,.cam #zoomBtn{background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.4)}
 details summary{cursor:pointer;color:var(--muted);font-size:.88rem}
 details[open] summary{margin-bottom:10px}
 .danger-zone{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -179,6 +180,7 @@ details[open] summary{margin-bottom:10px}
   <div class="aim" aria-hidden="true"></div>
   <div class="camtop"><span id="camMsg">Apunta al código de barras</span></div>
   <div class="cambar">
+    <button type="button" id="zoomBtn" hidden>Zoom 1x</button>
     <button type="button" id="torchBtn" hidden>Linterna</button>
     <button type="button" class="primary" id="camClose">Listo</button>
   </div>
@@ -412,7 +414,8 @@ const cam = {el:$('cam'), video:$('camVideo'), msg:$('camMsg'), aim:document.que
 async function openCam(){
   if(!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)){ camFail(); return; }
   try{
-    cam.stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}, audio:false});
+    // más resolución = barras finas del IMEI más nítidas
+    cam.stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:2560}, height:{ideal:1440}}, audio:false});
   }catch(e){ camFail(e); return; }
   cam.el.hidden = false; cam.video.srcObject = cam.stream;
   try{ await cam.video.play(); }catch(e){}
@@ -421,9 +424,33 @@ async function openCam(){
   const caps = track && track.getCapabilities ? track.getCapabilities() : {};
   $('torchBtn').hidden = !caps.torch; cam.torch = false;
   try{ if(caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({advanced:[{focusMode:'continuous'}]}); }catch(e){}
+  // Zoom: permite tener el teléfono más lejos (donde sí enfoca) y que el código se vea grande.
+  cam.zooms = [];
+  if(caps.zoom && caps.zoom.max > 1){
+    cam.zooms = [1, 2, 3].filter(z => z >= (caps.zoom.min||1) && z <= caps.zoom.max);
+    if(!cam.zooms.includes(caps.zoom.max) && caps.zoom.max < 3) cam.zooms.push(caps.zoom.max);
+  }
+  $('zoomBtn').hidden = cam.zooms.length < 2;
+  await setZoom(cam.zooms.length > 1 ? Math.min(2, cam.zooms[cam.zooms.length-1]) : null);
   cam.det = null;
   if('BarcodeDetector' in window){ try{ cam.det = new BarcodeDetector(); }catch(e){ cam.det = null; } }
-  cam.timer = setInterval(camTick, 160);
+  cam.tick = 0;
+  cam.timer = setInterval(camTick, 120);
+}
+async function setZoom(z){
+  const track = cam.stream && cam.stream.getVideoTracks()[0];
+  if(!track || z==null) return;
+  try{ await track.applyConstraints({advanced:[{zoom:z}]}); cam.zoom = z; }catch(e){ cam.zoom = 1; }
+  $('zoomBtn').textContent = 'Zoom ' + (Math.round(cam.zoom*10)/10) + 'x';
+}
+$('zoomBtn').addEventListener('click', () => {
+  const i = cam.zooms.indexOf(cam.zoom);
+  setZoom(cam.zooms[(i+1) % cam.zooms.length]);
+});
+// Con varios códigos en la etiqueta, elige el IMEI válido si hay uno.
+function pickCode(list){
+  const vals = list.filter(Boolean);
+  return vals.find(t => isImei(normalize(t))) || vals[0] || null;
 }
 function camFail(e){
   const denied = e && (e.name==='NotAllowedError' || e.name==='SecurityError');
@@ -449,15 +476,17 @@ async function camTick(){
   cam.busy = true;
   try{
     let text = null;
+    cam.tick++;
     if(cam.det){
-      try{ const r = await cam.det.detect(v); if(r.length) text = r[0].rawValue; }catch(e){ cam.det = null; }
+      try{ const r = await cam.det.detect(v); if(r.length) text = pickCode(r.map(x => x.rawValue)); }catch(e){ cam.det = null; }
     }
-    if(!text && !cam.det && window.ZXing){
+    // ZXing: siempre si no hay detector nativo; si lo hay, como respaldo cada 3 cuadros
+    if(!text && window.ZXing && (!cam.det || cam.tick % 3 === 0)){
       const Z = window.ZXing;
       if(!zReader){ zReader = new Z.MultiFormatReader(); const h = new Map(); h.set(Z.DecodeHintType.TRY_HARDER, true); zReader.setHints(h); }
-      // recorta la franja central (donde está el recuadro) para leer más rápido
-      const sw = v.videoWidth, sh = Math.round(v.videoHeight*0.45), sy = Math.round(v.videoHeight*0.275);
-      const sc = Math.min(1, 1280/sw);
+      // recorta la franja central (donde está el recuadro) sin reducirla, para no perder las barras finas
+      const sw = v.videoWidth, sh = Math.round(v.videoHeight*0.5), sy = Math.round(v.videoHeight*0.25);
+      const sc = Math.min(1, 1920/sw);
       camCanvas.width = Math.round(sw*sc); camCanvas.height = Math.round(sh*sc);
       camCanvas.getContext('2d', {willReadFrequently:true}).drawImage(v, 0, sy, sw, sh, 0, 0, camCanvas.width, camCanvas.height);
       try{ const r = zReader.decode(new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(camCanvas)))); text = r && r.getText(); }catch(e){}
